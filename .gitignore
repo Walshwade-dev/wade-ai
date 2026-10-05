@@ -1,0 +1,26 @@
+# Python virtual environments
+.venv/
+venv/
+ENV/
+
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Distribution and packaging
+dist/
+build/
+*.egg-info/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
