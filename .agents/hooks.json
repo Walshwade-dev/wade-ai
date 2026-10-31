@@ -1,0 +1,16 @@
+{
+  "wade-ai-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "wade-ai hook-pre-tool",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

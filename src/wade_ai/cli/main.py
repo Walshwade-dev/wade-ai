@@ -134,6 +134,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--once", action="store_true", help="Poll updates once and exit immediately."
     )
 
+    # 4. hook-pre-tool command (Antigravity PreToolUse hook)
+    subparsers.add_parser("hook-pre-tool", help="Run Antigravity PreToolUse hook on stdin.")
+
+    # 5. install-git-hook command
+    git_hook_cmd = subparsers.add_parser("install-git-hook", help="Install pre-commit hook in .git/hooks.")
+    git_hook_cmd.add_argument(
+        "--repo", type=str, default=".", help="Repository root path (default: current directory)."
+    )
+
+    # 6. mcp command (Model Context Protocol stdio server)
+    subparsers.add_parser("mcp", help="Run Model Context Protocol (MCP) server over stdio.")
+
     return parser
 
 
@@ -338,6 +350,18 @@ def handle_poll_approvals(args: argparse.Namespace) -> int:
         return 0
 
 
+def handle_install_git_hook(args: argparse.Namespace) -> int:
+    """Install git pre-commit hook."""
+    from wade_ai.integrations.git_hook import install_git_hook
+    try:
+        hook_path = install_git_hook(args.repo)
+        print(f"✅ Installed wade-ai git pre-commit hook at: {hook_path}")
+        return 0
+    except Exception as exc:
+        sys.stderr.write(f"Error installing git hook: {exc}\n")
+        return 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entrypoint."""
     parser = build_parser()
@@ -349,6 +373,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return handle_check_plan(args)
     elif args.command == "poll-approvals":
         return handle_poll_approvals(args)
+    elif args.command == "hook-pre-tool":
+        from wade_ai.integrations.antigravity_hook import main_hook
+        return main_hook()
+    elif args.command == "install-git-hook":
+        return handle_install_git_hook(args)
+    elif args.command == "mcp":
+        from wade_ai.mcp.server import run_mcp_server
+        run_mcp_server()
+        return 0
 
     return 0
 
