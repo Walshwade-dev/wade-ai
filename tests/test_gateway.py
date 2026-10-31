@@ -319,3 +319,187 @@ def test_metrics_provider_failure_with_fake_clock():
     assert result.metrics.provider_latency_ms == pytest.approx(2000.0)
     assert result.metrics.total_latency_ms == pytest.approx(3500.0)
     assert result.metrics.provider_used == "FakeProvider"
+
+
+# --- Fallback routing (Phase 5) -------------------------------------------------
+
+
+class FakeFallbackProvider(FakeProvider):
+    """Distinct class name so metrics can tell primary and fallback apart."""
+
+
+def test_no_fallback_configured_keeps_single_attempt():
+    provider = FakeProvider(outcome=ProviderAPIError("down"))
+    result = ReviewGateway(provider).review(_context())
+
+    assert result.verdict == ReviewVerdict.INSUFFICIENT_CONTEXT
+    assert result.metrics.attempts == 1
+    assert result.metrics.fallback_triggered is False
+
+
+def test_primary_success_does_not_call_fallback():
+    primary = FakeProvider(outcome=_response(ReviewVerdict.PASS))
+    fallback = FakeFallbackProvider(outcome=_response(ReviewVerdict.BLOCK))
+
+    result = ReviewGateway(primary, fallback_provider=fallback).review(_context())
+
+    assert len(primary.calls) == 1
+    assert fallback.calls == []
+    assert result.verdict == ReviewVerdict.PASS
+    assert result.metrics.provider_used == "FakeProvider"
+    assert result.metrics.attempts == 1
+    assert result.metrics.fallback_triggered is False
+
+
+@pytest.mark.parametrize(
+    "primary_outcome",
+    [
+        ProviderTimeoutError("timed out"),
+        ProviderAPIError("error status 503"),
+        ProviderResponseError("bad output"),
+        ProviderConfigError("misconfigured"),
+        None,  # invalid return type
+    ],
+)
+def test_primary_failure_uses_fallback(primary_outcome):
+    primary = FakeProvider(outcome=primary_outcome)
+    fallback_response = _response(ReviewVerdict.HIGH_RISK, summary="Fallback review.")
+    fallback_response.raw_model_name = "qwen/qwen3-8b"
+    fallback = FakeFallbackProvider(outcome=fallback_response, model="qwen/qwen3-8b")
+    ctx = _context()
+
+    result = ReviewGateway(primary, fallback_provider=fallback).review(ctx)
+
+    assert len(primary.calls) == 1
+    assert len(fallback.calls) == 1
+    assert fallback.calls[0] is ctx  # same bounded context, nothing added
+    assert result.verdict == ReviewVerdict.HIGH_RISK
+    assert result.summary == "Fallback review."
+    assert result.model_response is fallback_response
+    assert result.metrics.provider_used == "FakeFallbackProvider"
+    assert result.metrics.model_used == "qwen/qwen3-8b"
+    assert result.metrics.attempts == 2
+    assert result.metrics.fallback_triggered is True
+    notes = [f for f in result.findings if f.category == "provider_fallback"]
+    assert len(notes) == 1
+    assert notes[0].severity == FindingSeverity.INFO
+    assert "FakeProvider" in notes[0].message
+
+
+def test_fallback_findings_order_policy_then_notice_then_model():
+    model_finding = ReviewFinding(category="logic", message="Model finding.")
+    primary = FakeProvider(outcome=ProviderAPIError("down"))
+    fallback = FakeFallbackProvider(
+        outcome=_response(ReviewVerdict.PASS, findings=[model_finding])
+    )
+    ctx = _context(test_results=TestResults(status=TestStatus.NOT_RUN))
+
+    result = ReviewGateway(primary, fallback_provider=fallback).review(ctx)
+
+    categories = [f.category for f in result.findings]
+    assert categories == ["tests", "provider_fallback", "logic"]
+
+
+def test_both_providers_fail_closed():
+    primary = FakeProvider(outcome=ProviderTimeoutError("primary timed out"))
+    fallback = FakeFallbackProvider(outcome=ProviderAPIError("fallback refused"))
+
+    result = ReviewGateway(primary, fallback_provider=fallback).review(_context())
+
+    assert result.verdict == ReviewVerdict.INSUFFICIENT_CONTEXT
+    assert result.model_response is None
+    failures = [f for f in result.findings if f.category == "provider_failure"]
+    assert len(failures) == 2
+    assert all(f.severity == FindingSeverity.HIGH for f in failures)
+    assert "FakeProvider" in failures[0].message
+    assert "primary timed out" in failures[0].message
+    assert "FakeFallbackProvider" in failures[1].message
+    assert "fallback refused" in failures[1].message
+    assert "primary timed out" in result.summary and "fallback refused" in result.summary
+    assert result.metrics.attempts == 2
+    assert result.metrics.fallback_triggered is True
+    assert result.metrics.provider_used == "FakeFallbackProvider"
+
+
+def test_fallback_never_called_when_policy_blocks():
+    primary = FakeProvider(outcome=_response(ReviewVerdict.PASS))
+    fallback = FakeFallbackProvider(outcome=_response(ReviewVerdict.PASS))
+
+    result = ReviewGateway(primary, fallback_provider=fallback).review(_context(diff=""))
+
+    assert primary.calls == []
+    assert fallback.calls == []
+    assert result.verdict == ReviewVerdict.INSUFFICIENT_CONTEXT
+
+
+def test_fallback_pass_cannot_override_policy():
+    """Even via fallback, the model verdict only applies when policy allowed."""
+    primary = FakeProvider(outcome=ProviderAPIError("down"))
+    fallback = FakeFallbackProvider(outcome=_response(ReviewVerdict.PASS))
+    ctx = _context(test_results=TestResults(status=TestStatus.FAILED, failed_count=2))
+
+    result = ReviewGateway(primary, fallback_provider=fallback).review(ctx)
+
+    assert result.verdict == ReviewVerdict.BLOCK
+    assert primary.calls == [] and fallback.calls == []
+
+
+def test_unexpected_exception_in_primary_does_not_trigger_fallback():
+    boom = RuntimeError("bug")
+    primary = FakeProvider(outcome=boom)
+    fallback = FakeFallbackProvider(outcome=_response(ReviewVerdict.PASS))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        ReviewGateway(primary, fallback_provider=fallback).review(_context())
+
+    assert excinfo.value is boom
+    assert fallback.calls == []
+
+
+def test_fallback_metrics_with_fake_clock():
+    # start, p1_start, p1_end, p2_start, p2_end, total_end
+    clock = FakeClock(0.0, 1.0, 2.0, 2.5, 4.0, 4.25)
+    primary = FakeProvider(outcome=ProviderTimeoutError("t"))
+    fallback = FakeFallbackProvider(outcome=_response(ReviewVerdict.PASS))
+
+    result = ReviewGateway(primary, clock=clock, fallback_provider=fallback).review(_context())
+
+    assert result.metrics.provider_latency_ms == pytest.approx(2500.0)  # 1000 + 1500
+    assert result.metrics.total_latency_ms == pytest.approx(4250.0)
+
+
+def test_real_providers_openai_fails_lmstudio_succeeds_without_key_leak():
+    """End-to-end through real provider classes on mocked transports."""
+    lm_payload = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": '{"verdict": "PASS", "summary": "Local review ok.", '
+                    '"findings": [], "risk_assessment": null}',
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+
+    def openai_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": f"overloaded {SECRET_KEY}"})
+
+    def lm_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/chat/completions"
+        assert "authorization" not in request.headers
+        return httpx.Response(200, json=lm_payload)
+
+    from wade_ai.providers.lmstudio_provider import LMStudioProvider
+
+    primary = OpenAIProvider(api_key=SECRET_KEY, transport=httpx.MockTransport(openai_handler))
+    fallback = LMStudioProvider(transport=httpx.MockTransport(lm_handler))
+
+    result = ReviewGateway(primary, fallback_provider=fallback).review(_context())
+
+    assert result.verdict == ReviewVerdict.PASS
+    assert result.metrics.provider_used == "LMStudioProvider"
+    assert result.metrics.model_used == "qwen/qwen3-8b"
+    assert result.metrics.fallback_triggered is True
+    assert SECRET_KEY not in result.model_dump_json()
