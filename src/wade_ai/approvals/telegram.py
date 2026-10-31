@@ -8,12 +8,30 @@ Communicates with Wade via Telegram Bot API:
 """
 
 import os
+from pathlib import Path
 from typing import Any
 import httpx
 
 from wade_ai.approvals.models import ApprovalRequest, ApprovalStatus
 from wade_ai.approvals.store import ApprovalStore
 from wade_ai.core.exceptions import ProviderAPIError, ProviderConfigError
+
+
+def _load_env_fallback() -> None:
+    """Helper to load .env file from project or home directory if present."""
+    for candidate in (Path(".env"), Path.home() / ".wade-ai" / ".env"):
+        if candidate.exists():
+            try:
+                for line in candidate.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("\"'")
+                        if k not in os.environ and v:
+                            os.environ[k] = v
+            except Exception:
+                pass
 
 
 class TelegramApprovalChannel:
@@ -26,8 +44,19 @@ class TelegramApprovalChannel:
         store: ApprovalStore | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        self.bot_token = (bot_token or os.environ.get("TELEGRAM_BOT_TOKEN", "")).strip()
-        self.chat_id = str(chat_id or os.environ.get("TELEGRAM_CHAT_ID", "")).strip()
+        if bot_token is None or chat_id is None:
+            _load_env_fallback()
+
+        if bot_token is not None:
+            self.bot_token = bot_token.strip()
+        else:
+            self.bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+
+        if chat_id is not None:
+            self.chat_id = str(chat_id).strip()
+        else:
+            self.chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
         self.store = store or ApprovalStore()
         self._transport = transport
 
