@@ -99,6 +99,11 @@ def build_parser() -> argparse.ArgumentParser:
     review_cmd.add_argument("--tests-passed", type=int, default=1, help="Count of passed tests.")
     review_cmd.add_argument("--tests-failed", type=int, default=0, help="Count of failed tests.")
     review_cmd.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
+    review_cmd.add_argument(
+        "--notify",
+        action="store_true",
+        help="Send Telegram approval card to Wade if verdict requires human decision.",
+    )
 
     # Provider overrides
     review_cmd.add_argument(
@@ -121,6 +126,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=".wade-ai/plan.md",
         help="Path to plan file to inspect.",
+    )
+
+    # 3. poll-approvals command
+    poll_cmd = subparsers.add_parser("poll-approvals", help="Run Telegram long-polling approval listener.")
+    poll_cmd.add_argument(
+        "--once", action="store_true", help="Poll updates once and exit immediately."
     )
 
     return parser
@@ -249,12 +260,41 @@ def handle_review(args: argparse.Namespace) -> int:
     gateway = ReviewGateway(primary, fallback_provider=fallback)
     result: GatewayResult = gateway.review(context)
 
-    # 9. Output formatting
+    # 9. Approval Routing (Check for auto-approval, auto-rejection, or escalation)
+    from wade_ai.approvals.router import ApprovalRouter
+    from wade_ai.approvals.models import ApprovalDisposition
+    from wade_ai.approvals.store import ApprovalStore
+
+    store = ApprovalStore()
+    router = ApprovalRouter(store)
+    outcome = router.route(context, result)
+
+    # Send Telegram notification if requested and escalated
+    if outcome.disposition == ApprovalDisposition.ESCALATED_HUMAN and args.notify:
+        try:
+            from wade_ai.approvals.telegram import TelegramApprovalChannel
+            channel = TelegramApprovalChannel(store=store)
+            if outcome.request:
+                channel.send_approval_request(outcome.request)
+                sys.stderr.write(f"Alert: Sent approval request {outcome.request.request_id} to Telegram.\n")
+        except Exception as exc:
+            sys.stderr.write(f"Warning: Could not dispatch Telegram approval alert: {exc}\n")
+
+    # 10. Output formatting
     if args.json:
-        print(result.model_dump_json(indent=2))
+        data = json.loads(result.model_dump_json())
+        data["approval_disposition"] = outcome.disposition.value
+        data["approval_reason"] = outcome.reason
+        data["diff_hash"] = outcome.diff_hash
+        if outcome.request:
+            data["approval_request_id"] = outcome.request.request_id
+        print(json.dumps(data, indent=2))
     else:
         print(f"VERDICT: {result.verdict}")
+        print(f"DISPOSITION: {outcome.disposition.value}")
         print(f"SUMMARY: {result.summary}")
+        if outcome.disposition == ApprovalDisposition.ESCALATED_HUMAN:
+            print(f"APPROVAL REQUIRED: Request ID: {outcome.request.request_id if outcome.request else 'none'}")
         if result.findings:
             print("\nFINDINGS:")
             for f in result.findings:
@@ -264,7 +304,38 @@ def handle_review(args: argparse.Namespace) -> int:
                     print(f"    Suggested fix: {f.suggestion}")
         print(f"\nMETRICS: total={result.metrics.total_latency_ms:.1f}ms, provider={result.metrics.provider_used or 'none'}")
 
+    # If outcome is AUTO_APPROVED (even for a prior-approved high risk change), return 0
+    if outcome.disposition == ApprovalDisposition.AUTO_APPROVED:
+        return 0
+
     return EXIT_CODES.get(result.verdict, 3)
+
+
+def handle_poll_approvals(args: argparse.Namespace) -> int:
+    """Run Telegram update polling listener."""
+    from wade_ai.approvals.telegram import TelegramApprovalChannel
+    from wade_ai.approvals.store import ApprovalStore
+
+    try:
+        channel = TelegramApprovalChannel(store=ApprovalStore())
+    except Exception as exc:
+        sys.stderr.write(f"Error initializing Telegram listener: {exc}\n")
+        return 1
+
+    print("🛡️ wade-ai Telegram Approval Listener active.")
+    if args.once:
+        channel.poll_once()
+        print("Polled once successfully.")
+        return 0
+
+    print("Listening for button clicks and commands (/approve, /reject, /pending)... (Ctrl+C to stop)")
+    offset = 0
+    try:
+        while True:
+            offset = channel.poll_once(offset)
+    except KeyboardInterrupt:
+        print("\nListener stopped.")
+        return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -276,6 +347,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return handle_review(args)
     elif args.command == "check-plan":
         return handle_check_plan(args)
+    elif args.command == "poll-approvals":
+        return handle_poll_approvals(args)
 
     return 0
 
