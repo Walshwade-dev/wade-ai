@@ -52,15 +52,11 @@ def normalize_diff_path(raw_path: str) -> str:
     if "\t" in cleaned:
         cleaned = cleaned.split("\t", 1)[0].strip()
 
-    # Strip standard git/patch prefixes
-    if cleaned.startswith("a/"):
-        cleaned = cleaned[2:]
-    elif cleaned.startswith("b/"):
-        cleaned = cleaned[2:]
-
-    # Strip leading relative prefixes
-    if cleaned.startswith("./"):
-        cleaned = cleaned[2:]
+    # Strip standard git/patch prefixes (a/, b/) and mnemonic prefixes (c/, i/, w/)
+    for prefix in ("a/", "b/", "c/", "i/", "w/", "./"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):]
+            break
 
     return cleaned.strip()
 

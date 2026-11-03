@@ -22,13 +22,16 @@ from typing import Sequence
 from wade_ai.core.models import (
     GatewayResult,
     ReviewContext,
+    ReviewMetrics,
     ReviewVerdict,
     ReviewerConfig,
     TestResults,
     TestStatus,
 )
+from wade_ai.core.env import load_env_fallback
 from wade_ai.gateway.orchestrator import ReviewGateway
 from wade_ai.integrations.plan_parser import load_plan_file
+from wade_ai.policy.engine import PolicyEngine
 from wade_ai.providers.factory import build_providers
 
 # Exit code mapping as specified
@@ -44,7 +47,7 @@ def _get_git_staged_diff() -> str:
     """Retrieve git staged diff using git diff --cached."""
     try:
         proc = subprocess.run(
-            ["git", "diff", "--cached"],
+            ["git", "diff", "--cached", "--no-prefix"],
             capture_output=True,
             text=True,
             check=False,
@@ -256,21 +259,46 @@ def handle_review(args: argparse.Namespace) -> int:
         metadata=metadata,
     )
 
-    # 8. Setup provider configuration
-    config = ReviewerConfig()
-    if args.primary_provider:
-        config.primary_provider = args.primary_provider
-    if args.fallback_provider:
-        config.fallback_provider = args.fallback_provider
+    # 8. Deterministic Policy Evaluation (Zero Cost / Zero Network)
+    policy_engine = PolicyEngine()
+    policy_decision = policy_engine.evaluate(context)
 
-    try:
-        primary, fallback = build_providers(config)
-    except Exception as exc:
-        sys.stderr.write(f"Configuration error: {exc}\n")
-        return 3
+    if policy_decision.verdict_override is not None:
+        result = GatewayResult(
+            verdict=policy_decision.verdict_override,
+            findings=list(policy_decision.violations),
+            summary="; ".join(policy_decision.reasons) or "Deterministic policy check completed.",
+            policy_decision=policy_decision,
+            metrics=ReviewMetrics(total_latency_ms=0.0),
+        )
+    else:
+        # Policy passed cleanly -> proceed to automated LLM review
+        config = ReviewerConfig()
+        if args.primary_provider:
+            config.primary_provider = args.primary_provider
+        if args.fallback_provider:
+            config.fallback_provider = args.fallback_provider
 
-    gateway = ReviewGateway(primary, fallback_provider=fallback)
-    result: GatewayResult = gateway.review(context)
+        try:
+            primary, fallback = build_providers(config)
+            gateway = ReviewGateway(primary, fallback_provider=fallback)
+            result = gateway.review(context)
+        except Exception as exc:
+            # Automated LLM unavailable: fail closed to HIGH_RISK for human escalation
+            from wade_ai.core.models import FindingSeverity, ReviewFinding
+            result = GatewayResult(
+                verdict=ReviewVerdict.HIGH_RISK,
+                findings=[
+                    ReviewFinding(
+                        severity=FindingSeverity.HIGH,
+                        category="gateway",
+                        message=f"Automated LLM review unavailable ({exc}); escalating for human decision.",
+                    )
+                ],
+                policy_decision=policy_decision,
+                summary=f"Automated LLM review unavailable ({exc}); escalating for human decision.",
+                metrics=ReviewMetrics(total_latency_ms=0.0),
+            )
 
     # 9. Approval Routing (Check for auto-approval, auto-rejection, or escalation)
     from wade_ai.approvals.router import ApprovalRouter
@@ -364,6 +392,7 @@ def handle_install_git_hook(args: argparse.Namespace) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entrypoint."""
+    load_env_fallback()
     parser = build_parser()
     args = parser.parse_args(argv)
 

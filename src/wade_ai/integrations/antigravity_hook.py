@@ -76,8 +76,9 @@ def evaluate_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
             pass
 
     task = parsed_plan.task if parsed_plan else "Review staged git commit."
-    authorized_files = parsed_plan.authorized_files if parsed_plan else []
-    constraints = parsed_plan.constraints if parsed_plan else []
+    authorized_files = list(parsed_plan.authorized_files) if parsed_plan and parsed_plan.authorized_files else []
+    constraints = list(parsed_plan.constraints) if parsed_plan and parsed_plan.constraints else []
+
     metadata = {}
     if parsed_plan and parsed_plan.plan_content:
         metadata["plan_context"] = parsed_plan.plan_content[:2000]
@@ -108,14 +109,23 @@ def evaluate_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
     config = ReviewerConfig()
     try:
         primary, fallback = build_providers(config)
+        gateway = ReviewGateway(primary, policy_engine=policy_engine, fallback_provider=fallback)
+        result: GatewayResult = gateway.review(context)
     except Exception as exc:
-        return {
-            "decision": "deny",
-            "reason": f"wade-ai configuration error: {exc}",
-        }
-
-    gateway = ReviewGateway(primary, policy_engine=policy_engine, fallback_provider=fallback)
-    result: GatewayResult = gateway.review(context)
+        from wade_ai.core.models import FindingSeverity, ReviewFinding, ReviewMetrics, ReviewVerdict
+        result = GatewayResult(
+            verdict=ReviewVerdict.HIGH_RISK,
+            findings=[
+                ReviewFinding(
+                    severity=FindingSeverity.HIGH,
+                    category="gateway",
+                    message=f"Automated LLM review unavailable ({exc}); escalating for human decision.",
+                )
+            ],
+            policy_decision=policy_decision,
+            summary=f"Automated LLM review unavailable ({exc}); escalating for human decision.",
+            metrics=ReviewMetrics(total_latency_ms=0.0),
+        )
 
     # Step 3: Route approval
     store = ApprovalStore()
