@@ -8,6 +8,7 @@ authorized_files:
   - "src/wade_ai/integrations/antigravity_hook.py"
   - "src/wade_ai/policy/diff_parser.py"
   - "tests/test_antigravity_hook.py"
+  - "README.md"
   - ".wade-ai/plan.md"
 constraints:
   - "no-deletions"
